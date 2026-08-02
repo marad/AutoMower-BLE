@@ -8,6 +8,7 @@ how the request and response classes can be used.
 
 import argparse
 import asyncio
+import binascii
 import datetime as dt
 import logging
 
@@ -78,9 +79,31 @@ class Mower(BLEClient):
             return None
 
         if command.validate_command_response(response) is False:
-            # Just log if the response is invalid as this has been seen with user
-            # logs from official apps. I.e. it is somewhat expected.
+            # --- LOCAL PATCH -------------------------------------------------
+            # Upstream logs this and parses the frame anyway, so a response that
+            # belongs to a *different* request gets decoded at the wrong offsets
+            # and blows up downstream (MowerActivity(<garbage>), IndexError...).
+            # Log enough to identify whose response it really is, then give up on
+            # this cycle instead of returning made-up data.
+            got = (
+                binascii.hexlify(response[12:16]).decode()
+                if len(response) > 15
+                else "<short>"
+            )
+            logger.warning(
+                "PATCH: %s got a response for a different request: "
+                "expected major=0x%04x minor=0x%02x, frame bytes12-15=%s, "
+                "len=%d, frame=%s",
+                command_name,
+                command.major,
+                command.minor,
+                got,
+                len(response),
+                binascii.hexlify(response).decode(),
+            )
             logger.warning("Response failed validation")
+            return None
+            # ------------------------------------------------------------------
 
         response_dict = command.parse_response(response)
         if (
