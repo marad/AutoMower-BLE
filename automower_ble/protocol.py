@@ -14,6 +14,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# --- LOCAL PATCH (homelab, 2026-08-02) --------------------------------------
+# This copy shadows the packaged automower-ble 0.2.9 through /config/deps.
+# Two changes, both marked "LOCAL PATCH" below:
+#   1. _read_data resynchronises on the 02 fd frame delimiter instead of
+#      trusting data[2] as a length no matter what arrived.
+#   2. validate_response dumps the raw frame when it rejects one.
+# To disable: rename the automower_ble directory under /config/deps and
+# restart Core. The packaged version in the image is untouched.
+logger.warning(
+    "automower_ble LOCAL PATCH v3 active: framing layer (resync + surplus retained "
+    "+ boundary check log-only), mower.command drops mismatched responses"
+)
+# ----------------------------------------------------------------------------
+
 
 class ModeOfOperation(IntEnum):
     # ProtocolTypes$IMowerAppMowerMode, used in modeOfOperation: 4586, 1
@@ -276,6 +290,11 @@ class BLEClient:
         self.lock = asyncio.Lock()
         self.queue: asyncio.Queue[bytearray] = asyncio.Queue()
 
+        # LOCAL PATCH v3: bytes read past the end of the previous frame. Upstream
+        # throws these away, which destroys the head of the next frame and makes
+        # the desync permanent.
+        self._rx = bytearray()
+
         self.client: BleakClient | None = None
         self.protocol = None
 
@@ -312,41 +331,111 @@ class BLEClient:
 
         logger.debug("Finished writing")
 
-    async def _read_data(self):
-        data = await self._get_response()
+    FRAME_DELIMITER = b"\x02\xfd"
+    MAX_RESYNC_BYTES = 512
 
-        if data is None:
+    async def _fill(self, data, timeout=None):
+        """LOCAL PATCH v3: append one more chunk, or None if nothing arrives."""
+        if timeout is None:
+            chunk = await self._get_response()
+        else:
+            try:
+                chunk = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            except TimeoutError:
+                return None
+        if chunk is None:
             return None
+        return data + chunk
 
-        if len(data) < 3:
-            # We got such a small amount of data, let's try again
-            if (chunk := await self._get_response()) is None:
-                return None
-            data = data + chunk
+    async def _read_data(self):
+        # --- LOCAL PATCH v3: a real framing layer -----------------------------
+        # Upstream reads the length straight out of data[2] without checking that
+        # the chunk starts a frame, and then returns the whole buffer including
+        # any overshoot. The overshoot is the head of the *next* frame, so it is
+        # destroyed and the misalignment becomes permanent. Here we resynchronise
+        # on the delimiter, keep the surplus for the next read, and check the
+        # frame boundary (log-only for now, so nothing is rejected yet).
+        data = bytearray(self._rx)
+        self._rx = bytearray()
 
-            if len(data) < 3:
-                # Something is wrong
+        if not data:
+            data = await self._get_response()
+            if data is None:
                 return None
+
+        dropped = 0
+        while True:
+            # 1. find a frame delimiter
+            while (offset := data.find(self.FRAME_DELIMITER)) == -1:
+                if len(data) > self.MAX_RESYNC_BYTES:
+                    logger.error(
+                        "PATCH: no frame delimiter in %d bytes, dropping: '%s'",
+                        len(data),
+                        binascii.hexlify(data).decode(),
+                    )
+                    return None
+                if (data := await self._fill(data)) is None:
+                    return None
+            if offset:
+                dropped += offset
+                data = data[offset:]
+
+            # 2. need four bytes to read the 16-bit length
+            while len(data) < 4:
+                if (data := await self._fill(data)) is None:
+                    return None
+
+            # 3. at a real frame head the high byte of the length is zero;
+            #    if it is not, we matched a delimiter inside a payload
+            if data[3] == 0x00:
+                break
+            logger.warning(
+                "PATCH: false frame head (byte3=0x%02x), stepping over it", data[3]
+            )
+            dropped += 2
+            data = data[2:]
+
+        if dropped:
+            logger.warning("PATCH: discarded %d byte(s) before the frame", dropped)
 
         length = data[2] + 4
-
         logger.debug("Waiting for %d bytes", length)
 
         while len(data) < length:
-            try:
-                data = data + await asyncio.wait_for(self.queue.get(), timeout=5)
-            except TimeoutError:
+            if (data := await self._fill(data, timeout=5)) is None:
                 logger.error(
-                    "Unable to get full response from device: '%s', currently have %s",
-                    str(binascii.hexlify(data)),
-                    self.address,
+                    "Unable to get full response from device: '%s'", self.address
                 )
-                logger.error("Expecting %d bytes, only have %d", length, len(data))
+                logger.error("Expecting %d bytes, only have %d", length, len(data or b""))
                 return None
 
-        logger.info("Final response: %s", str(binascii.hexlify(data)))
+        frame = data[:length]
+        self._rx = bytearray(data[length:])
+        if self._rx:
+            logger.warning(
+                "PATCH: kept %d surplus byte(s) for the next read: '%s'",
+                len(self._rx),
+                binascii.hexlify(self._rx).decode(),
+            )
 
-        return data
+        # 4. boundary check, log-only: do not reject anything yet
+        if frame[length - 1] != 0x03:
+            logger.warning(
+                "PATCH: frame does not end in 0x03: '%s'",
+                binascii.hexlify(frame).decode(),
+            )
+        elif frame[length - 2] != (expected := crc(frame, 1, length - 3)):
+            logger.warning(
+                "PATCH: trailing CRC mismatch, got 0x%02x expected 0x%02x: '%s'",
+                frame[length - 2],
+                expected,
+                binascii.hexlify(frame).decode(),
+            )
+        # ----------------------------------------------------------------------
+
+        logger.info("Final response: %s", str(binascii.hexlify(frame)))
+
+        return frame
 
     async def _request_response(self, request_data):
         async with self.lock:
@@ -354,6 +443,13 @@ class BLEClient:
                 # If there are previous responses, flush them out
                 while not self.queue.empty():
                     await self.queue.get()
+                # LOCAL PATCH v3: the leftover buffer is part of that stale state.
+                if self._rx:
+                    logger.warning(
+                        "PATCH: dropping %d stale surplus byte(s) before request",
+                        len(self._rx),
+                    )
+                    self._rx = bytearray()
 
                 await self._write_data(request_data)
 
@@ -579,6 +675,18 @@ class BLEClient:
         return data
 
     def validate_response(self, response_data: bytearray) -> bool:
+        # --- LOCAL PATCH: dump the raw frame whenever validation rejects it ---
+        ok = self._validate_response_checks(response_data)
+        if not ok:
+            logger.warning(
+                "PATCH: validation failed, len=%d channel_id=%s frame='%s'",
+                len(response_data),
+                hex(self.channel_id),
+                str(binascii.hexlify(response_data)),
+            )
+        return ok
+
+    def _validate_response_checks(self, response_data: bytearray) -> bool:
         if response_data[0] != 0x02:
             return False
 
