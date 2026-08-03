@@ -43,7 +43,33 @@ class Mower(BLEClient):
         status = await super().connect(device)
         if status == ResponseResult.OK:
             self.task = asyncio.create_task(self._keep_alive())
+            await self._log_schedule_diagnostics()
         return status
+
+    async def _log_schedule_diagnostics(self):
+        """LOCAL PATCH v4, temporary: why is the mower not starting on schedule?
+
+        The Home Assistant integration exposes none of this, and the answer is a
+        single query away. Remove once the question is settled.
+        """
+        try:
+            reason = await self.command("GetRestrictionReason")
+            override = await self.command("GetOverride")
+            nxt = await self.command("GetNextStartTime")
+            mode = await self.command("GetMode")
+            logger.warning(
+                "PATCH schedule: restrictionReason=%s mode=%s override=%s "
+                "nextStartTime=%s (%s)",
+                reason,
+                mode,
+                override,
+                nxt,
+                dt.datetime.fromtimestamp(nxt, dt.UTC).isoformat()
+                if isinstance(nxt, int) and nxt
+                else "none",
+            )
+        except Exception as e:  # diagnostics must never break a connection
+            logger.warning("PATCH schedule: diagnostics failed: %s", e)
 
     async def disconnect(self):
         """
