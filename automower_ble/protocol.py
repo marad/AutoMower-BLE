@@ -589,12 +589,6 @@ class BLEClient:
         async def notification_handler(
             characteristic: BleakGATTCharacteristic, data: bytearray
         ):
-            # LOCAL PATCH v4, temporary: log every chunk as it arrives, with its
-            # size. Needed to tell whether the mower really sends the two trailing
-            # bytes of a frame or declares a length it does not deliver.
-            logger.warning(
-                "PATCH: rx chunk %2d bytes: %s", len(data), binascii.hexlify(data).decode()
-            )
             logger.info("Received: %s", str(binascii.hexlify(data)))
             await self.queue.put(data)
 
