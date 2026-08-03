@@ -74,7 +74,9 @@ class Mower(BLEClient):
         """
         command = Command(self.channel_id, (await self.get_protocol())[command_name])
         request = command.generate_request(**kwargs)
-        response = await self._request_response(request)
+        response = await self._request_response(
+            request, is_ours=command.is_response_to_this_command
+        )
         if response is None:
             return None
 

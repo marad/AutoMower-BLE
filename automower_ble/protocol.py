@@ -233,6 +233,22 @@ class Command:
             raise ValueError(f"Data length mismatch. Read {dpos} bytes of {len(data)}")
         return response
 
+    def is_response_to_this_command(self, response_data: bytearray) -> bool:
+        """LOCAL PATCH v4: does this frame answer *this* request?
+
+        Deliberately narrower than validate_command_response: it looks only at
+        the command identity, so a genuine error response to our own request
+        still counts as ours and is not retried away.
+        """
+        if len(response_data) < 16:
+            return False
+        major_bytes = self.major.to_bytes(4, byteorder="little")
+        return (
+            response_data[12] == major_bytes[0]
+            and response_data[13] == major_bytes[1]
+            and response_data[14] == self.minor
+        )
+
     def validate_command_response(self, response_data: bytearray) -> bool:
         if response_data[0] != 0x02:
             return False
@@ -409,6 +425,23 @@ class BLEClient:
                 logger.error("Expecting %d bytes, only have %d", length, len(data or b""))
                 return None
 
+        # LOCAL PATCH v4: the declared length is not always what is on the wire.
+        # Observed on a 305: byte 2 says 0x12, i.e. a 22-byte frame, while the
+        # mower delivers 20 bytes and the next frame's 02 fd follows immediately.
+        # Trusting the length then steals two bytes from the next frame and
+        # corrupts both. If the terminator is not where the length claims, prefer
+        # the boundary implied by the next delimiter.
+        if data[length - 1] != 0x03:
+            alt = data.find(self.FRAME_DELIMITER, 2)
+            if alt != -1 and alt != length:
+                logger.warning(
+                    "PATCH: declared length %d has no terminator; next delimiter "
+                    "at %d, using that as the frame boundary",
+                    length,
+                    alt,
+                )
+                length = alt
+
         frame = data[:length]
         self._rx = bytearray(data[length:])
         if self._rx:
@@ -437,7 +470,7 @@ class BLEClient:
 
         return frame
 
-    async def _request_response(self, request_data):
+    async def _request_response(self, request_data, is_ours=None, max_foreign=3):
         async with self.lock:
             try:
                 # If there are previous responses, flush them out
@@ -453,13 +486,32 @@ class BLEClient:
 
                 await self._write_data(request_data)
 
-                response_data = await self._read_data()
-                if response_data is None:
-                    logger.error(
-                        "Unable to communicate with device: '%s'", self.address
+                # LOCAL PATCH v4: a frame arriving now may answer an earlier
+                # request. Upstream hands it to the caller anyway; read past it
+                # instead, bounded so a chatty device cannot spin us forever.
+                for attempt in range(max_foreign + 1):
+                    response_data = await self._read_data()
+                    if response_data is None:
+                        logger.error(
+                            "Unable to communicate with device: '%s'", self.address
+                        )
+                        if self.is_connected():
+                            await self.disconnect()
+                        return None
+                    if is_ours is None or is_ours(response_data):
+                        break
+                    logger.warning(
+                        "PATCH: discarding a response to an earlier request "
+                        "(%d/%d): %s",
+                        attempt + 1,
+                        max_foreign,
+                        binascii.hexlify(response_data).decode(),
                     )
-                    if self.is_connected():
-                        await self.disconnect()
+                else:
+                    logger.error(
+                        "PATCH: no matching response after %d foreign frames",
+                        max_foreign,
+                    )
                     return None
 
             except asyncio.exceptions.CancelledError:
