@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # restart Core. The packaged version in the image is untouched.
 logger.warning(
     "automower_ble LOCAL PATCH v4 active: framing layer + delimiter-implied frame "
-    "boundary + read past foreign responses + raw chunk log + schedule diagnostics"
+    "boundary + read past foreign responses + schedule diagnostics"
 )
 # ----------------------------------------------------------------------------
 
