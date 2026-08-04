@@ -425,23 +425,6 @@ class BLEClient:
                 logger.error("Expecting %d bytes, only have %d", length, len(data or b""))
                 return None
 
-        # LOCAL PATCH v4: the declared length is not always what is on the wire.
-        # Observed on a 305: byte 2 says 0x12, i.e. a 22-byte frame, while the
-        # mower delivers 20 bytes and the next frame's 02 fd follows immediately.
-        # Trusting the length then steals two bytes from the next frame and
-        # corrupts both. If the terminator is not where the length claims, prefer
-        # the boundary implied by the next delimiter.
-        if data[length - 1] != 0x03:
-            alt = data.find(self.FRAME_DELIMITER, 2)
-            if alt != -1 and alt != length:
-                logger.warning(
-                    "PATCH: declared length %d has no terminator; next delimiter "
-                    "at %d, using that as the frame boundary",
-                    length,
-                    alt,
-                )
-                length = alt
-
         frame = data[:length]
         self._rx = bytearray(data[length:])
         if self._rx:

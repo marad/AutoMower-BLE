@@ -47,98 +47,27 @@ class Mower(BLEClient):
         return status
 
     async def _log_schedule_diagnostics(self):
-        """LOCAL PATCH v4, temporary: why is the mower not starting on schedule?
+        """LOCAL PATCH v5, temporary: why is the mower not starting on schedule?
 
-        The Home Assistant integration exposes none of this, and the answer is a
-        single query away. Remove once the question is settled.
+        The Home Assistant integration exposes none of this. Each query is isolated,
+        because one response the library cannot parse must not take the others with
+        it. Remove once the question is settled.
         """
-        try:
-            reason = await self.command("GetRestrictionReason")
-            override = await self.command("GetOverride")
-            nxt = await self.command("GetNextStartTime")
-            mode = await self.command("GetMode")
-            logger.warning(
-                "PATCH schedule: restrictionReason=%s mode=%s override=%s "
-                "nextStartTime=%s (%s)",
-                reason,
-                mode,
-                override,
-                nxt,
-                dt.datetime.fromtimestamp(nxt, dt.UTC).isoformat()
-                if isinstance(nxt, int) and nxt
-                else "none",
-            )
-        except Exception as e:  # diagnostics must never break a connection
-            logger.warning("PATCH schedule: diagnostics failed: %s", e)
-
-    async def disconnect(self):
-        """
-        Disconnect from the mower, this should be called after every
-        `connect()` before the Python script exits
-        """
-        self.keep_alive_event.set()
-        return await super().disconnect()
-
-    async def _keep_alive(self):
-        """
-        Keep the connection alive by sending a request every 15 seconds.
-        This is needed to prevent the connection from being closed by the mower.
-        """
-        while not self.keep_alive_event.is_set():
+        for name in (
+            "GetRestrictionReason",
+            "GetMode",
+            "GetOverride",
+            "GetNextStartTime",
+        ):
             try:
-                if self.is_connected():
-                    logger.debug("Sending keep alive")
-                    await self.command("KeepAlive")
+                value = await self.command(name)
             except Exception as e:
-                logger.warning("Failed to send keep alive: %s", e)
-            await asyncio.sleep(15)
-
-    async def command(self, command_name: str, **kwargs):
-        """
-        This function is used to simplify the communication of the mower using the commands found in protocol.json.
-        It will send a request to the mower and then wait for a response. The response will be parsed and returned to the caller.
-        """
-        command = Command(self.channel_id, (await self.get_protocol())[command_name])
-        request = command.generate_request(**kwargs)
-        response = await self._request_response(
-            request, is_ours=command.is_response_to_this_command
-        )
-        if response is None:
-            return None
-
-        if command.validate_command_response(response) is False:
-            # --- LOCAL PATCH -------------------------------------------------
-            # Upstream logs this and parses the frame anyway, so a response that
-            # belongs to a *different* request gets decoded at the wrong offsets
-            # and blows up downstream (MowerActivity(<garbage>), IndexError...).
-            # Log enough to identify whose response it really is, then give up on
-            # this cycle instead of returning made-up data.
-            got = (
-                binascii.hexlify(response[12:16]).decode()
-                if len(response) > 15
-                else "<short>"
-            )
-            logger.warning(
-                "PATCH: %s got a response for a different request: "
-                "expected major=0x%04x minor=0x%02x, frame bytes12-15=%s, "
-                "len=%d, frame=%s",
-                command_name,
-                command.major,
-                command.minor,
-                got,
-                len(response),
-                binascii.hexlify(response).decode(),
-            )
-            logger.warning("Response failed validation")
-            return None
-            # ------------------------------------------------------------------
-
-        response_dict = command.parse_response(response)
-        if (
-            response_dict is not None and len(response_dict) == 1
-        ):  # If there is only one key in the response, return the value
-            return response_dict["response"]
-        return response_dict
+                logger.warning("PATCH schedule: %s failed: %s", name, e)
+                continue
+            extra = ""
+            if name == "GetNextStartTime" and isinstance(value, int) and value:
+                extra = " (" + dt.datetime.fromtimestamp(value, dt.UTC).isoformat() + ")"
+            logger.warning("PATCH schedule: %s = %s%s", name, value, extra)
 
     async def get_manufacturer(self) -> str | None:
         """Get the mower manufacturer"""
