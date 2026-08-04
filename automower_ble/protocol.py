@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 # To disable: rename the automower_ble directory under /config/deps and
 # restart Core. The packaged version in the image is untouched.
 logger.warning(
-    "automower_ble LOCAL PATCH v4 active: framing layer + delimiter-implied frame "
-    "boundary + read past foreign responses + schedule diagnostics"
+    "automower_ble LOCAL PATCH v5 active: framing layer + read past foreign "
+    "responses + schedule diagnostics"
 )
 # ----------------------------------------------------------------------------
 
