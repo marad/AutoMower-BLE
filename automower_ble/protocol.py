@@ -20,11 +20,13 @@ logger = logging.getLogger(__name__)
 #   1. _read_data resynchronises on the 02 fd frame delimiter instead of
 #      trusting data[2] as a length no matter what arrived.
 #   2. validate_response dumps the raw frame when it rejects one.
+#   3. response matching ignores delayed frames, including the unlinked
+#      handshake response that can arrive while the PIN exchange is pending.
 # To disable: rename the automower_ble directory under /config/deps and
 # restart Core. The packaged version in the image is untouched.
 logger.warning(
-    "automower_ble LOCAL PATCH v5 active: framing layer + read past foreign "
-    "responses + schedule diagnostics"
+    "automower_ble LOCAL PATCH v6 active: framing + response matching + "
+    "safe connect parsing + schedule diagnostics"
 )
 # ----------------------------------------------------------------------------
 
@@ -85,6 +87,10 @@ class ResponseResult(IntEnum):
     DEVICE_BUSY = 8
     INVALID_PIN = 9
     MOWER_BLOCKED = 10
+
+
+class InvalidResponseError(ValueError):
+    """The mower sent a frame that is not a linked command response."""
 
 
 class TaskInformation:
@@ -234,13 +240,22 @@ class Command:
         return response
 
     def is_response_to_this_command(self, response_data: bytearray) -> bool:
-        """LOCAL PATCH v4: does this frame answer *this* request?
+        """LOCAL PATCH v6: does this frame answer *this* request?
 
-        Deliberately narrower than validate_command_response: it looks only at
-        the command identity, so a genuine error response to our own request
-        still counts as ours and is not retried away.
+        Deliberately narrower than validate_command_response: it checks the
+        linked-frame envelope and command identity, but not the result byte, so
+        a genuine error response to our own request still counts as ours and is
+        not retried away.
         """
-        if len(response_data) < 16:
+        if len(response_data) < 17 or response_data[2] + 4 != len(response_data):
+            return False
+        if response_data[3] != 0x00:
+            return False
+        if response_data[4:8] != self.channel_id.to_bytes(4, byteorder="little"):
+            return False
+        if response_data[8] != 0x01 or response_data[10] != 0x01:
+            return False
+        if response_data[11] != 0xAF:
             return False
         major_bytes = self.major.to_bytes(4, byteorder="little")
         return (
@@ -326,9 +341,9 @@ class BLEClient:
             )
         return self.protocol
 
-    async def _get_response(self):
+    async def _get_response(self, timeout=10):
         try:
-            data = await asyncio.wait_for(self.queue.get(), timeout=10)
+            data = await asyncio.wait_for(self.queue.get(), timeout=timeout)
 
         except TimeoutError:
             logger.error("Unable to get response from device: '%s'", self.address)
@@ -350,20 +365,17 @@ class BLEClient:
     FRAME_DELIMITER = b"\x02\xfd"
     MAX_RESYNC_BYTES = 512
 
-    async def _fill(self, data, timeout=None):
+    async def _fill(self, data, timeout=10):
         """LOCAL PATCH v3: append one more chunk, or None if nothing arrives."""
-        if timeout is None:
-            chunk = await self._get_response()
-        else:
-            try:
-                chunk = await asyncio.wait_for(self.queue.get(), timeout=timeout)
-            except TimeoutError:
-                return None
+        try:
+            chunk = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+        except TimeoutError:
+            return None
         if chunk is None:
             return None
         return data + chunk
 
-    async def _read_data(self):
+    async def _read_data(self, timeout=10):
         # --- LOCAL PATCH v3: a real framing layer -----------------------------
         # Upstream reads the length straight out of data[2] without checking that
         # the chunk starts a frame, and then returns the whole buffer including
@@ -371,11 +383,16 @@ class BLEClient:
         # destroyed and the misalignment becomes permanent. Here we resynchronise
         # on the delimiter, keep the surplus for the next read, and check the
         # frame boundary (log-only for now, so nothing is rejected yet).
+        deadline = asyncio.get_running_loop().time() + timeout
+
+        def remaining():
+            return max(0, deadline - asyncio.get_running_loop().time())
+
         data = bytearray(self._rx)
         self._rx = bytearray()
 
         if not data:
-            data = await self._get_response()
+            data = await self._get_response(timeout=remaining())
             if data is None:
                 return None
 
@@ -390,7 +407,7 @@ class BLEClient:
                         binascii.hexlify(data).decode(),
                     )
                     return None
-                if (data := await self._fill(data)) is None:
+                if (data := await self._fill(data, timeout=remaining())) is None:
                     return None
             if offset:
                 dropped += offset
@@ -398,7 +415,7 @@ class BLEClient:
 
             # 2. need four bytes to read the 16-bit length
             while len(data) < 4:
-                if (data := await self._fill(data)) is None:
+                if (data := await self._fill(data, timeout=remaining())) is None:
                     return None
 
             # 3. at a real frame head the high byte of the length is zero;
@@ -418,7 +435,7 @@ class BLEClient:
         logger.debug("Waiting for %d bytes", length)
 
         while len(data) < length:
-            if (data := await self._fill(data, timeout=5)) is None:
+            if (data := await self._fill(data, timeout=remaining())) is None:
                 logger.error(
                     "Unable to get full response from device: '%s'", self.address
                 )
@@ -453,7 +470,7 @@ class BLEClient:
 
         return frame
 
-    async def _request_response(self, request_data, is_ours=None, max_foreign=3):
+    async def _request_response(self, request_data, is_ours=None, timeout=10):
         async with self.lock:
             try:
                 # If there are previous responses, flush them out
@@ -469,11 +486,22 @@ class BLEClient:
 
                 await self._write_data(request_data)
 
-                # LOCAL PATCH v4: a frame arriving now may answer an earlier
-                # request. Upstream hands it to the caller anyway; read past it
-                # instead, bounded so a chatty device cannot spin us forever.
-                for attempt in range(max_foreign + 1):
-                    response_data = await self._read_data()
+                # LOCAL PATCH v6: a frame arriving now may answer an earlier
+                # request. Keep reading until the expected response arrives or
+                # the overall deadline expires; a fixed count is unsafe because
+                # the mower can repeat a delayed response several times.
+                deadline = asyncio.get_running_loop().time() + timeout
+                skipped = 0
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        logger.error(
+                            "PATCH: no matching response after %d foreign frames",
+                            skipped,
+                        )
+                        return None
+
+                    response_data = await self._read_data(timeout=remaining)
                     if response_data is None:
                         logger.error(
                             "Unable to communicate with device: '%s'", self.address
@@ -483,19 +511,13 @@ class BLEClient:
                         return None
                     if is_ours is None or is_ours(response_data):
                         break
+                    skipped += 1
                     logger.warning(
                         "PATCH: discarding a response to an earlier request "
-                        "(%d/%d): %s",
-                        attempt + 1,
-                        max_foreign,
+                        "(%d): %s",
+                        skipped,
                         binascii.hexlify(response_data).decode(),
                     )
-                else:
-                    logger.error(
-                        "PATCH: no matching response after %d foreign frames",
-                        max_foreign,
-                    )
-                    return None
 
             except asyncio.exceptions.CancelledError:
                 logger.debug("Received CancelledError")
@@ -598,10 +620,17 @@ class BLEClient:
                 self.channel_id, (await self.get_protocol())["EnterOperatorPin"]
             )
             request = command.generate_request(code=self.pin)
-            response = await self._request_response(request)
+            response = await self._request_response(
+                request,
+                is_ours=command.is_response_to_this_command,
+            )
             if response is None:
                 return ResponseResult.UNKNOWN_ERROR
-            result = self.get_response_result(response)
+            try:
+                result = self.get_response_result(response)
+            except InvalidResponseError as err:
+                logger.warning("Invalid EnterOperatorPin response: %s", err)
+                return ResponseResult.UNKNOWN_ERROR
             # If the result is UNKNOWN_ERROR, assume the pin was invalid
             return (
                 ResponseResult.INVALID_PIN
@@ -721,7 +750,15 @@ class BLEClient:
             )
         return ok
 
-    def _validate_response_checks(self, response_data: bytearray) -> bool:
+    def _validate_response_checks(
+        self, response_data: bytearray, require_ok: bool = True
+    ) -> bool:
+        if len(response_data) < 17:
+            return False
+
+        if response_data[2] + 4 != len(response_data):
+            return False
+
         if response_data[0] != 0x02:
             return False
 
@@ -748,18 +785,35 @@ class BLEClient:
         if response_data[11] != 0xAF:
             return False
 
-        if (
-            response_data[16] != 0x00
-        ):  # result: OK(0), UNKNOWN_ERROR(1), INVALID_VALUE(2), OUT_OF_RANGE(3), NOT_AVAILABLE(4), NOT_ALLOWED(5), INVALID_GROUP(6), INVALID_ID(7), DEVICE_BUSY(8), INVALID_PIN(9), MOWER_BLOCKED(10);
+        # The transport may deliver a response header/payload before the
+        # trailing CRC/terminator bytes (and may interleave those bytes with a
+        # later notification).  _read_data keeps the boundary diagnostics
+        # log-only for that reason.  The command identity and result byte are
+        # already within the validated linked envelope, so do not turn a
+        # delayed tail into a false protocol failure here.
+        if require_ok and response_data[16] != 0x00:
             logger.warning("Non zero response result: %d", response_data[16])
             return False
 
         return True
 
     def get_response_result(self, response_data: bytearray) -> ResponseResult:
-        if self.validate_response(response_data) is False:
-            # Just log if the response is invalid as this has been seen with user
-            # logs from official apps. I.e. it is somewhat expected.
+        # A non-zero result is a valid response (for example INVALID_PIN), so
+        # validate the frame structure separately from the result value. The
+        # old implementation logged a failed validation and then indexed byte
+        # 16 unconditionally, which crashed on the 15-byte unlinked handshake
+        # response.
+        if not self._validate_response_checks(response_data, require_ok=False):
             logger.warning("Response failed validation")
+            raise InvalidResponseError(
+                f"invalid linked response ({len(response_data)} bytes): "
+                f"{binascii.hexlify(response_data).decode()}"
+            )
 
-        return ResponseResult(response_data[16])
+        try:
+            return ResponseResult(response_data[16])
+        except (IndexError, ValueError) as err:
+            raise InvalidResponseError(
+                f"invalid response result in frame: "
+                f"{binascii.hexlify(response_data).decode()}"
+            ) from err

@@ -47,7 +47,7 @@ class Mower(BLEClient):
         return status
 
     async def _log_schedule_diagnostics(self):
-        """LOCAL PATCH v5, temporary: why is the mower not starting on schedule?
+        """LOCAL PATCH v6, temporary: why is the mower not starting on schedule?
 
         The Home Assistant integration exposes none of this. Each query is isolated,
         because one response the library cannot parse must not take the others with
