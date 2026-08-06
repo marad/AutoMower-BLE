@@ -58,6 +58,7 @@ class Mower(BLEClient):
             "GetMode",
             "GetOverride",
             "GetNextStartTime",
+            "GetTime",
         ):
             try:
                 value = await self.command(name)
