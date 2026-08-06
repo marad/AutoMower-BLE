@@ -4,6 +4,7 @@ from enum import IntEnum
 import asyncio
 import logging
 import json
+from dataclasses import dataclass
 from importlib.resources import files
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
@@ -25,11 +26,14 @@ logger = logging.getLogger(__name__)
 #   4. incomplete/invalid frames stay in the receive stream until their declared
 #      length and trailer are present; a following delimiter is never consumed
 #      as a missing tail.
+#   5. notifications carry a session and arrival sequence so a response already
+#      buffered before a new request cannot masquerade as its response.
 # To disable: rename the automower_ble directory under /config/deps and
 # restart Core. The packaged version in the image is untouched.
 logger.warning(
-    "automower_ble LOCAL PATCH v7 active: framing + response matching + "
-    "complete-frame validation + safe connect parsing + schedule diagnostics"
+    "automower_ble LOCAL PATCH v8 active: framing + response matching + "
+    "arrival generations + complete-frame validation + safe connect parsing + "
+    "schedule diagnostics"
 )
 # ----------------------------------------------------------------------------
 
@@ -39,6 +43,13 @@ def _has_valid_frame_boundary(frame: bytearray) -> bool:
     if len(frame) < 4 or frame[2] + 4 != len(frame):
         return False
     return frame[-1] == 0x03 and frame[-2] == crc(frame, 1, len(frame) - 3)
+
+
+@dataclass(slots=True)
+class _QueuedNotification:
+    session: int
+    sequence: int
+    data: bytearray
 
 
 class ModeOfOperation(IntEnum):
@@ -333,12 +344,21 @@ class BLEClient:
         self.MTU_SIZE = 20
 
         self.lock = asyncio.Lock()
-        self.queue: asyncio.Queue[bytearray] = asyncio.Queue()
+        self.queue: asyncio.Queue[_QueuedNotification | None] = asyncio.Queue()
+
+        # Every notification gets a monotonically increasing arrival sequence.
+        # A request records the current value before writing; complete frames
+        # whose last byte predates that watermark are stale leftovers from an
+        # earlier request and are not allowed to satisfy the new one. A frame
+        # that completes while the write is in progress remains eligible.
+        self._session = 0
+        self._notification_sequence = 0
 
         # LOCAL PATCH v3: bytes read past the end of the previous frame. Upstream
         # throws these away, which destroys the head of the next frame and makes
         # the desync permanent.
         self._rx = bytearray()
+        self._rx_sequences: list[int] = []
 
         self.client: BleakClient | None = None
         self.protocol = None
@@ -355,15 +375,68 @@ class BLEClient:
             )
         return self.protocol
 
+    def _make_notification(self, data, session=None):
+        """Stamp a notification at the point it enters the receive queue."""
+        self._notification_sequence += 1
+        return _QueuedNotification(
+            self._session if session is None else session,
+            self._notification_sequence,
+            bytearray(data),
+        )
+
+    def _queue_notification(self, data, session=None):
+        """Test/helper hook matching the production notification callback."""
+        self.queue.put_nowait(self._make_notification(data, session=session))
+
+    def _reset_receive_state(self, clear_queue=False):
+        self._rx = bytearray()
+        self._rx_sequences = []
+        if clear_queue:
+            while True:
+                try:
+                    self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+    async def _get_notification(self, timeout=10):
+        """Return the next notification for the active session."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            remaining = max(0, deadline - asyncio.get_running_loop().time())
+            try:
+                item = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+            except TimeoutError:
+                logger.error(
+                    "Unable to get response from device: '%s'", self.address
+                )
+                return None
+
+            if item is None:
+                return None
+
+            # Keep compatibility with raw bytearray queue entries used by older
+            # callers; production and updated tests use stamped notifications.
+            if not isinstance(item, _QueuedNotification):
+                item = self._make_notification(item)
+
+            if item.session != self._session:
+                logger.debug(
+                    "PATCH: ignoring notification from old session %d (current %d)",
+                    item.session,
+                    self._session,
+                )
+                continue
+            return item
+
     async def _get_response(self, timeout=10):
         try:
-            data = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            notification = await self._get_notification(timeout=timeout)
 
         except TimeoutError:
             logger.error("Unable to get response from device: '%s'", self.address)
             return None
 
-        return data
+        return None if notification is None else notification.data
 
     async def _write_data(self, data):
         logger.info("Writing: %s", str(binascii.hexlify(data)))
@@ -380,18 +453,17 @@ class BLEClient:
     MAX_RESYNC_BYTES = 512
     MAX_FRAME_LENGTH = 259
 
-    async def _fill(self, data, timeout=10):
-        """LOCAL PATCH v3: append one more chunk, or None if nothing arrives."""
-        try:
-            chunk = await asyncio.wait_for(self.queue.get(), timeout=timeout)
-        except TimeoutError:
+    async def _fill(self, data, sequences, timeout=10):
+        """Append one stamped notification, or None if nothing arrives."""
+        notification = await self._get_notification(timeout=timeout)
+        if notification is None:
             return None
-        if chunk is None:
-            return None
-        return data + chunk
+        data.extend(notification.data)
+        sequences.extend([notification.sequence] * len(notification.data))
+        return data, sequences
 
-    async def _read_data(self, timeout=10):
-        # --- LOCAL PATCH v7: a complete-frame receive layer -------------------
+    async def _read_data(self, timeout=10, min_sequence=None):
+        # --- LOCAL PATCH v8: a complete-frame receive layer -------------------
         # Notifications are fragments, not frames.  Keep a persistent byte
         # buffer, wait for the declared length, and validate the trailer before
         # returning anything to the command matcher.  If a previous cycle lost
@@ -403,12 +475,18 @@ class BLEClient:
             return max(0, deadline - asyncio.get_running_loop().time())
 
         data = bytearray(self._rx)
-        self._rx = bytearray()
+        sequences = list(self._rx_sequences)
+        if data and len(sequences) != len(data):
+            # A raw _rx value can only come from an older caller/test. Treat it
+            # as pre-existing data so it cannot satisfy a newly started request.
+            sequences = [0] * len(data)
+        self._reset_receive_state()
 
         if not data:
-            data = await self._get_response(timeout=remaining())
-            if data is None:
+            filled = await self._fill(data, sequences, timeout=remaining())
+            if filled is None:
                 return None
+            data, sequences = filled
 
         dropped = 0
         while True:
@@ -422,16 +500,21 @@ class BLEClient:
                         binascii.hexlify(data).decode(),
                     )
                     return None
-                if (data := await self._fill(data, timeout=remaining())) is None:
+                filled = await self._fill(data, sequences, timeout=remaining())
+                if filled is None:
                     return None
+                data, sequences = filled
             if offset:
                 dropped += offset
                 data = data[offset:]
+                sequences = sequences[offset:]
 
             # 2. Need four bytes to read the declared length.
             while len(data) < 4:
-                if (data := await self._fill(data, timeout=remaining())) is None:
+                filled = await self._fill(data, sequences, timeout=remaining())
+                if filled is None:
                     return None
+                data, sequences = filled
 
             # A real frame has a zero high length byte.  If a delimiter occurs
             # inside a payload, step over it and look for the next candidate.
@@ -442,6 +525,7 @@ class BLEClient:
                 )
                 dropped += 2
                 data = data[2:]
+                sequences = sequences[2:]
                 continue
 
             length = data[2] + 4
@@ -453,11 +537,13 @@ class BLEClient:
                 )
                 dropped += 2
                 data = data[2:]
+                sequences = sequences[2:]
                 continue
 
             logger.debug("Waiting for %d bytes", length)
             while len(data) < length:
-                if (data := await self._fill(data, timeout=remaining())) is None:
+                filled = await self._fill(data, sequences, timeout=remaining())
+                if filled is None:
                     logger.error(
                         "Unable to get full response from device: '%s'", self.address
                     )
@@ -465,6 +551,7 @@ class BLEClient:
                         "Expecting %d bytes, only have %d", length, len(data or b"")
                     )
                     return None
+                data, sequences = filled
 
             frame = data[:length]
             if not _has_valid_frame_boundary(frame):
@@ -489,6 +576,7 @@ class BLEClient:
                 if next_offset >= 0:
                     dropped += next_offset
                     data = data[next_offset:]
+                    sequences = sequences[next_offset:]
                     if dropped > self.MAX_RESYNC_BYTES:
                         logger.error(
                             "PATCH: exceeded resync limit while rejecting frames"
@@ -500,6 +588,24 @@ class BLEClient:
                 # delimiter byte and wait for another notification.
                 dropped += max(0, len(data) - 1)
                 data = data[-1:] if data[-1:] == self.FRAME_DELIMITER[:1] else bytearray()
+                sequences = sequences[-1:] if data else []
+                continue
+
+            # A response may start arriving while the request is still being
+            # written.  Reject only a frame whose *last* byte was already
+            # queued before the request watermark; a frame completed after the
+            # write may legitimately have its first fragment before it.
+            frame_last_sequence = sequences[length - 1]
+            if min_sequence is not None and frame_last_sequence < min_sequence:
+                logger.warning(
+                    "PATCH: discarding stale frame from before request "
+                    "(last notification %d < %d): '%s'",
+                    frame_last_sequence,
+                    min_sequence,
+                    binascii.hexlify(frame).decode(),
+                )
+                data = data[length:]
+                sequences = sequences[length:]
                 continue
 
             if dropped:
@@ -508,6 +614,7 @@ class BLEClient:
             # Keep every byte after this complete frame for the next read.  It
             # may already contain one or more complete notifications.
             self._rx = bytearray(data[length:])
+            self._rx_sequences = list(sequences[length:])
             if self._rx:
                 logger.warning(
                     "PATCH: kept %d surplus byte(s) for the next read: '%s'",
@@ -521,13 +628,18 @@ class BLEClient:
     async def _request_response(self, request_data, is_ours=None, timeout=10):
         async with self.lock:
             try:
+                # Record the receive watermark before writing.  Notifications
+                # already stamped at or below it belong to an earlier request;
+                # a response generated after this write gets a higher sequence.
+                request_sequence = self._notification_sequence
+
                 # Do not flush the queue or _rx here.  A notification may be the
                 # tail of a frame that started during the previous request.  The
                 # framing layer will finish it and the response matcher will
                 # discard it if it belongs to an earlier command.
                 await self._write_data(request_data)
 
-                # LOCAL PATCH v6: a frame arriving now may answer an earlier
+                # LOCAL PATCH v8: a frame arriving now may answer an earlier
                 # request. Keep reading until the expected response arrives or
                 # the overall deadline expires; a fixed count is unsafe because
                 # the mower can repeat a delayed response several times.
@@ -542,7 +654,10 @@ class BLEClient:
                         )
                         return None
 
-                    response_data = await self._read_data(timeout=remaining)
+                    response_data = await self._read_data(
+                        timeout=remaining,
+                        min_sequence=request_sequence + 1,
+                    )
                     if response_data is None:
                         logger.error(
                             "Unable to communicate with device: '%s'", self.address
@@ -579,9 +694,9 @@ class BLEClient:
         # A new GATT session cannot complete fragments from the old session.
         # Clear its sentinel/queued bytes here, once per reconnect, rather than
         # flushing a potentially live frame before every request.
-        self._rx = bytearray()
-        while not self.queue.empty():
-            await self.queue.get()
+        self._session += 1
+        session = self._session
+        self._reset_receive_state(clear_queue=True)
 
         if device is None:
             logger.error("could not find device with address '%s'", self.address)
@@ -643,7 +758,7 @@ class BLEClient:
             characteristic: BleakGATTCharacteristic, data: bytearray
         ):
             logger.info("Received: %s", str(binascii.hexlify(data)))
-            await self.queue.put(data)
+            await self.queue.put(self._make_notification(data, session=session))
 
         try:
             await self.client.start_notify(self.read_char, notification_handler)
@@ -751,6 +866,10 @@ class BLEClient:
         await self.client.disconnect()
         logger.info("disconnected")
 
+        # Nothing from this GATT session may be joined to a future one.  The
+        # sentinel still wakes any reader that is waiting for a notification.
+        self._session += 1
+        self._reset_receive_state(clear_queue=True)
         await self.queue.put(None)
 
     def generate_request_setup_channel_id(self) -> bytearray:
