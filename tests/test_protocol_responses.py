@@ -126,6 +126,53 @@ class TestProtocolResponses(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response, expected)
         client.disconnect.assert_not_awaited()
 
+    async def test_disconnect_drops_incomplete_frame_before_next_session(self):
+        command = Command(CHANNEL_ID, self.protocol["GetBatteryLevel"])
+        expected = linked_response(command, payload=b"\x05")
+        client = BLEClient(CHANNEL_ID, "00:00:00:00:00:00")
+
+        # The link disappears after only a fragment.  The partial frame must
+        # not be joined to bytes received after the next GATT connection.
+        client.queue.put_nowait(expected[:20])
+        client.queue.put_nowait(None)
+        self.assertIsNone(await client._read_data(timeout=1))
+        self.assertEqual(client._rx, bytearray())
+
+        client.queue.put_nowait(expected)
+        self.assertEqual(await client._read_data(timeout=1), expected)
+
+    async def test_timeout_then_late_foreign_response_is_skipped(self):
+        stale_command = Command(CHANNEL_ID, self.protocol["GetBatteryLevel"])
+        current_command = Command(CHANNEL_ID, self.protocol["EnterOperatorPin"])
+        stale = linked_response(stale_command, payload=b"\x05")
+        expected = linked_response(current_command)
+        client = BLEClient(CHANNEL_ID, "00:00:00:00:00:00")
+        client.client = SimpleNamespace(is_connected=True)
+        client.disconnect = AsyncMock()
+        client._write_data = AsyncMock()
+
+        # The first request times out.  A response to it arrives only after
+        # that timeout, before the next request is issued.
+        self.assertIsNone(
+            await client._request_response(
+                current_command.generate_request(code=7201),
+                is_ours=current_command.is_response_to_this_command,
+                timeout=0.01,
+            )
+        )
+        client.disconnect.assert_awaited_once()
+
+        client.queue.put_nowait(stale)
+        client.queue.put_nowait(expected)
+        response = await client._request_response(
+            current_command.generate_request(code=7201),
+            is_ours=current_command.is_response_to_this_command,
+            timeout=1,
+        )
+
+        self.assertEqual(response, expected)
+        self.assertEqual(client.get_response_result(response), ResponseResult.OK)
+
     async def test_pin_request_skips_delayed_handshake_response(self):
         command = Command(CHANNEL_ID, self.protocol["EnterOperatorPin"])
         expected = linked_response(command)
