@@ -22,13 +22,23 @@ logger = logging.getLogger(__name__)
 #   2. validate_response dumps the raw frame when it rejects one.
 #   3. response matching ignores delayed frames, including the unlinked
 #      handshake response that can arrive while the PIN exchange is pending.
+#   4. incomplete/invalid frames stay in the receive stream until their declared
+#      length and trailer are present; a following delimiter is never consumed
+#      as a missing tail.
 # To disable: rename the automower_ble directory under /config/deps and
 # restart Core. The packaged version in the image is untouched.
 logger.warning(
-    "automower_ble LOCAL PATCH v6 active: framing + response matching + "
-    "safe connect parsing + schedule diagnostics"
+    "automower_ble LOCAL PATCH v7 active: framing + response matching + "
+    "complete-frame validation + safe connect parsing + schedule diagnostics"
 )
 # ----------------------------------------------------------------------------
+
+
+def _has_valid_frame_boundary(frame: bytearray) -> bool:
+    """Return whether ``frame`` has the declared length and trailer."""
+    if len(frame) < 4 or frame[2] + 4 != len(frame):
+        return False
+    return frame[-1] == 0x03 and frame[-2] == crc(frame, 1, len(frame) - 3)
 
 
 class ModeOfOperation(IntEnum):
@@ -240,14 +250,18 @@ class Command:
         return response
 
     def is_response_to_this_command(self, response_data: bytearray) -> bool:
-        """LOCAL PATCH v6: does this frame answer *this* request?
+        """LOCAL PATCH v7: does this complete frame answer *this* request?
 
         Deliberately narrower than validate_command_response: it checks the
         linked-frame envelope and command identity, but not the result byte, so
         a genuine error response to our own request still counts as ours and is
         not retried away.
         """
-        if len(response_data) < 17 or response_data[2] + 4 != len(response_data):
+        if (
+            len(response_data) < 17
+            or response_data[:2] != b"\x02\xfd"
+            or not _has_valid_frame_boundary(response_data)
+        ):
             return False
         if response_data[3] != 0x00:
             return False
@@ -364,6 +378,7 @@ class BLEClient:
 
     FRAME_DELIMITER = b"\x02\xfd"
     MAX_RESYNC_BYTES = 512
+    MAX_FRAME_LENGTH = 259
 
     async def _fill(self, data, timeout=10):
         """LOCAL PATCH v3: append one more chunk, or None if nothing arrives."""
@@ -376,13 +391,12 @@ class BLEClient:
         return data + chunk
 
     async def _read_data(self, timeout=10):
-        # --- LOCAL PATCH v3: a real framing layer -----------------------------
-        # Upstream reads the length straight out of data[2] without checking that
-        # the chunk starts a frame, and then returns the whole buffer including
-        # any overshoot. The overshoot is the head of the *next* frame, so it is
-        # destroyed and the misalignment becomes permanent. Here we resynchronise
-        # on the delimiter, keep the surplus for the next read, and check the
-        # frame boundary (log-only for now, so nothing is rejected yet).
+        # --- LOCAL PATCH v7: a complete-frame receive layer -------------------
+        # Notifications are fragments, not frames.  Keep a persistent byte
+        # buffer, wait for the declared length, and validate the trailer before
+        # returning anything to the command matcher.  If a previous cycle lost
+        # a tail, the next 02 fd delimiter is preserved for resynchronisation;
+        # it is never consumed as the missing CRC/terminator.
         deadline = asyncio.get_running_loop().time() + timeout
 
         def remaining():
@@ -398,7 +412,8 @@ class BLEClient:
 
         dropped = 0
         while True:
-            # 1. find a frame delimiter
+            # 1. Find a frame delimiter.  Bytes before it are an orphaned tail
+            # or a fragment from an invalid frame and can be discarded.
             while (offset := data.find(self.FRAME_DELIMITER)) == -1:
                 if len(data) > self.MAX_RESYNC_BYTES:
                     logger.error(
@@ -413,77 +428,103 @@ class BLEClient:
                 dropped += offset
                 data = data[offset:]
 
-            # 2. need four bytes to read the 16-bit length
+            # 2. Need four bytes to read the declared length.
             while len(data) < 4:
                 if (data := await self._fill(data, timeout=remaining())) is None:
                     return None
 
-            # 3. at a real frame head the high byte of the length is zero;
-            #    if it is not, we matched a delimiter inside a payload
-            if data[3] == 0x00:
-                break
-            logger.warning(
-                "PATCH: false frame head (byte3=0x%02x), stepping over it", data[3]
-            )
-            dropped += 2
-            data = data[2:]
-
-        if dropped:
-            logger.warning("PATCH: discarded %d byte(s) before the frame", dropped)
-
-        length = data[2] + 4
-        logger.debug("Waiting for %d bytes", length)
-
-        while len(data) < length:
-            if (data := await self._fill(data, timeout=remaining())) is None:
-                logger.error(
-                    "Unable to get full response from device: '%s'", self.address
+            # A real frame has a zero high length byte.  If a delimiter occurs
+            # inside a payload, step over it and look for the next candidate.
+            if data[3] != 0x00:
+                logger.warning(
+                    "PATCH: false frame head (byte3=0x%02x), stepping over it",
+                    data[3],
                 )
-                logger.error("Expecting %d bytes, only have %d", length, len(data or b""))
-                return None
+                dropped += 2
+                data = data[2:]
+                continue
 
-        frame = data[:length]
-        self._rx = bytearray(data[length:])
-        if self._rx:
-            logger.warning(
-                "PATCH: kept %d surplus byte(s) for the next read: '%s'",
-                len(self._rx),
-                binascii.hexlify(self._rx).decode(),
-            )
+            length = data[2] + 4
+            if not 4 <= length <= self.MAX_FRAME_LENGTH:
+                logger.warning(
+                    "PATCH: invalid frame length %d from '%s'",
+                    length,
+                    binascii.hexlify(data[:4]).decode(),
+                )
+                dropped += 2
+                data = data[2:]
+                continue
 
-        # 4. boundary check, log-only: do not reject anything yet
-        if frame[length - 1] != 0x03:
-            logger.warning(
-                "PATCH: frame does not end in 0x03: '%s'",
-                binascii.hexlify(frame).decode(),
-            )
-        elif frame[length - 2] != (expected := crc(frame, 1, length - 3)):
-            logger.warning(
-                "PATCH: trailing CRC mismatch, got 0x%02x expected 0x%02x: '%s'",
-                frame[length - 2],
-                expected,
-                binascii.hexlify(frame).decode(),
-            )
-        # ----------------------------------------------------------------------
+            logger.debug("Waiting for %d bytes", length)
+            while len(data) < length:
+                if (data := await self._fill(data, timeout=remaining())) is None:
+                    logger.error(
+                        "Unable to get full response from device: '%s'", self.address
+                    )
+                    logger.error(
+                        "Expecting %d bytes, only have %d", length, len(data or b"")
+                    )
+                    return None
 
-        logger.info("Final response: %s", str(binascii.hexlify(frame)))
+            frame = data[:length]
+            if not _has_valid_frame_boundary(frame):
+                if frame[length - 1] != 0x03:
+                    logger.warning(
+                        "PATCH: frame does not end in 0x03: '%s'",
+                        binascii.hexlify(frame).decode(),
+                    )
+                else:
+                    expected = crc(frame, 1, length - 3)
+                    logger.warning(
+                        "PATCH: trailing CRC mismatch, got 0x%02x expected 0x%02x: '%s'",
+                        frame[length - 2],
+                        expected,
+                        binascii.hexlify(frame).decode(),
+                    )
 
-        return frame
+                # Prefer the next delimiter already present in the accumulated
+                # bytes.  This is the common 20-byte head + next 02 fd case and
+                # preserves the next frame instead of consuming its first bytes.
+                next_offset = data.find(self.FRAME_DELIMITER, 2)
+                if next_offset >= 0:
+                    dropped += next_offset
+                    data = data[next_offset:]
+                    if dropped > self.MAX_RESYNC_BYTES:
+                        logger.error(
+                            "PATCH: exceeded resync limit while rejecting frames"
+                        )
+                        return None
+                    continue
+
+                # No next delimiter is available yet.  Retain a possible first
+                # delimiter byte and wait for another notification.
+                dropped += max(0, len(data) - 1)
+                data = data[-1:] if data[-1:] == self.FRAME_DELIMITER[:1] else bytearray()
+                continue
+
+            if dropped:
+                logger.warning("PATCH: discarded %d byte(s) before the frame", dropped)
+
+            # Keep every byte after this complete frame for the next read.  It
+            # may already contain one or more complete notifications.
+            self._rx = bytearray(data[length:])
+            if self._rx:
+                logger.warning(
+                    "PATCH: kept %d surplus byte(s) for the next read: '%s'",
+                    len(self._rx),
+                    binascii.hexlify(self._rx).decode(),
+                )
+
+            logger.info("Final response: %s", str(binascii.hexlify(frame)))
+            return frame
 
     async def _request_response(self, request_data, is_ours=None, timeout=10):
         async with self.lock:
             try:
-                # If there are previous responses, flush them out
-                while not self.queue.empty():
-                    await self.queue.get()
-                # LOCAL PATCH v3: the leftover buffer is part of that stale state.
-                if self._rx:
-                    logger.warning(
-                        "PATCH: dropping %d stale surplus byte(s) before request",
-                        len(self._rx),
-                    )
-                    self._rx = bytearray()
-
+                # Do not flush the queue or _rx here.  A notification may be the
+                # tail of a frame that started during the previous request.  The
+                # framing layer will finish it and the response matcher will
+                # discard it if it belongs to an earlier command.
                 await self._write_data(request_data)
 
                 # LOCAL PATCH v6: a frame arriving now may answer an earlier
@@ -534,6 +575,13 @@ class BLEClient:
         Returns a ResponseResult
         """
         logger.info("starting scan...")
+
+        # A new GATT session cannot complete fragments from the old session.
+        # Clear its sentinel/queued bytes here, once per reconnect, rather than
+        # flushing a potentially live frame before every request.
+        self._rx = bytearray()
+        while not self.queue.empty():
+            await self.queue.get()
 
         if device is None:
             logger.error("could not find device with address '%s'", self.address)
@@ -756,7 +804,7 @@ class BLEClient:
         if len(response_data) < 17:
             return False
 
-        if response_data[2] + 4 != len(response_data):
+        if not _has_valid_frame_boundary(response_data):
             return False
 
         if response_data[0] != 0x02:
@@ -785,12 +833,6 @@ class BLEClient:
         if response_data[11] != 0xAF:
             return False
 
-        # The transport may deliver a response header/payload before the
-        # trailing CRC/terminator bytes (and may interleave those bytes with a
-        # later notification).  _read_data keeps the boundary diagnostics
-        # log-only for that reason.  The command identity and result byte are
-        # already within the validated linked envelope, so do not turn a
-        # delayed tail into a false protocol failure here.
         if require_ok and response_data[16] != 0x00:
             logger.warning("Non zero response result: %d", response_data[16])
             return False
