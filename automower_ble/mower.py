@@ -73,14 +73,19 @@ class Mower(BLEClient):
         """
         command = Command(self.channel_id, (await self.get_protocol())[command_name])
         request = command.generate_request(**kwargs)
-        response = await self._request_response(request)
+        response = await self._request_response(
+            request, is_ours=command.is_response_to_this_command
+        )
         if response is None:
             return None
 
         if command.validate_command_response(response) is False:
-            # Just log if the response is invalid as this has been seen with user
-            # logs from official apps. I.e. it is somewhat expected.
-            logger.warning("Response failed validation")
+            logger.warning(
+                "Command %s failed with response result %d",
+                command_name,
+                response[16],
+            )
+            return None
 
         response_dict = command.parse_response(response)
         if (

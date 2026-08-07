@@ -4,6 +4,7 @@ from enum import IntEnum
 import asyncio
 import logging
 import json
+from dataclasses import dataclass
 from importlib.resources import files
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
@@ -13,6 +14,36 @@ if TYPE_CHECKING:
     from bleak import BleakClient
 
 logger = logging.getLogger(__name__)
+
+
+def _has_valid_frame_boundary(frame: bytearray) -> bool:
+    """Return whether ``frame`` has the declared length and trailer."""
+    if len(frame) < 4 or frame[2] + 4 != len(frame):
+        return False
+    return frame[-1] == 0x03 and frame[-2] == crc(frame, 1, len(frame) - 3)
+
+
+def _is_valid_linked_response(frame: bytearray, channel_id: int) -> bool:
+    """Return whether ``frame`` is a complete linked response."""
+    return (
+        len(frame) >= 19
+        and frame[:2] == b"\x02\xfd"
+        and _has_valid_frame_boundary(frame)
+        and frame[3] == 0x00
+        and frame[4:8] == channel_id.to_bytes(4, byteorder="little")
+        and frame[8] == 0x01
+        and frame[9] == crc(frame, 1, 8)
+        and frame[10] == 0x01
+        and frame[11] == 0xAF
+        and frame[15] == 0x00
+    )
+
+
+@dataclass(slots=True)
+class _QueuedNotification:
+    session: int
+    sequence: int
+    data: bytearray
 
 
 class ModeOfOperation(IntEnum):
@@ -71,6 +102,10 @@ class ResponseResult(IntEnum):
     DEVICE_BUSY = 8
     INVALID_PIN = 9
     MOWER_BLOCKED = 10
+
+
+class InvalidResponseError(ValueError):
+    """The mower sent a frame that is not a linked command response."""
 
 
 class TaskInformation:
@@ -219,51 +254,21 @@ class Command:
             raise ValueError(f"Data length mismatch. Read {dpos} bytes of {len(data)}")
         return response
 
+    def is_response_to_this_command(self, response_data: bytearray) -> bool:
+        """Return whether a response belongs to this command."""
+        if not _is_valid_linked_response(response_data, self.channel_id):
+            return False
+        major_bytes = self.major.to_bytes(2, byteorder="little")
+        return (
+            response_data[12] == major_bytes[0]
+            and response_data[13] == major_bytes[1]
+            and response_data[14] == self.minor
+        )
+
     def validate_command_response(self, response_data: bytearray) -> bool:
-        if response_data[0] != 0x02:
+        if not self.is_response_to_this_command(response_data):
             return False
-
-        if response_data[1] != 0xFD:
-            return False
-
-        if response_data[3] != 0x00:  # high byte of length
-            return False
-
-        if response_data[4:8] != self.channel_id.to_bytes(4, byteorder="little"):
-            return False
-
-        if response_data[8] != 0x01:
-            # This is a valid config, but we don't support it
-            # return m1656b(decodeState, c10786f);
-            return False
-
-        if response_data[9] != crc(response_data, 1, 8):
-            return False
-
-        if response_data[10] != 0x01:  # packet type is not 0x01 = response
-            return False
-
-        if response_data[11] != 0xAF:
-            return False
-
-        major_bytes = self.major.to_bytes(4, byteorder="little")
-        if response_data[12] != major_bytes[0]:
-            return False
-        if response_data[13] != major_bytes[1]:
-            return False
-        if response_data[14] != self.minor:
-            return False
-
-        if response_data[15] != 0x00:  # high byte of 'command' (self.minor)
-            return False
-
-        if (
-            response_data[16] != 0x00
-        ):  # result: OK(0), UNKNOWN_ERROR(1), INVALID_VALUE(2), OUT_OF_RANGE(3), NOT_AVAILABLE(4), NOT_ALLOWED(5), INVALID_GROUP(6), INVALID_ID(7), DEVICE_BUSY(8), INVALID_PIN(9), MOWER_BLOCKED(10);
-            logger.warning("Non zero response result: %d", response_data[16])
-            return False
-
-        return True
+        return response_data[16] == ResponseResult.OK
 
 
 class BLEClient:
@@ -274,7 +279,15 @@ class BLEClient:
         self.MTU_SIZE = 20
 
         self.lock = asyncio.Lock()
-        self.queue: asyncio.Queue[bytearray] = asyncio.Queue()
+        self.queue: asyncio.Queue[_QueuedNotification | None] = asyncio.Queue()
+
+        # Arrival sequences prevent buffered frames from satisfying a later
+        # request, while session ids keep reconnects isolated.
+        self._session = 0
+        self._notification_sequence = 0
+
+        self._rx = bytearray()
+        self._rx_sequences: list[int] = []
 
         self.client: BleakClient | None = None
         self.protocol = None
@@ -291,15 +304,58 @@ class BLEClient:
             )
         return self.protocol
 
-    async def _get_response(self):
-        try:
-            data = await asyncio.wait_for(self.queue.get(), timeout=10)
+    def _make_notification(self, data, session=None):
+        """Stamp a notification at the point it enters the receive queue."""
+        self._notification_sequence += 1
+        return _QueuedNotification(
+            self._session if session is None else session,
+            self._notification_sequence,
+            bytearray(data),
+        )
 
-        except TimeoutError:
-            logger.error("Unable to get response from device: '%s'", self.address)
-            return None
+    def _queue_notification(self, data, session=None):
+        """Test/helper hook matching the production notification callback."""
+        self.queue.put_nowait(self._make_notification(data, session=session))
 
-        return data
+    def _reset_receive_state(self, clear_queue=False):
+        self._rx = bytearray()
+        self._rx_sequences = []
+        if clear_queue:
+            while True:
+                try:
+                    self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+    async def _get_notification(self, deadline):
+        """Return the next notification for the active session."""
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                logger.error("Unable to get response from device: '%s'", self.address)
+                return None
+            try:
+                item = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+            except TimeoutError:
+                logger.error("Unable to get response from device: '%s'", self.address)
+                return None
+
+            if item is None:
+                return None
+
+            if not isinstance(item, _QueuedNotification):
+                # Raw queue entries predate request generations. They remain
+                # readable directly, but cannot satisfy a new request.
+                item = _QueuedNotification(self._session, 0, bytearray(item))
+
+            if item.session != self._session:
+                logger.debug(
+                    "Ignoring notification from old session %d (current %d)",
+                    item.session,
+                    self._session,
+                )
+                continue
+            return item
 
     async def _write_data(self, data):
         logger.info("Writing: %s", str(binascii.hexlify(data)))
@@ -312,59 +368,178 @@ class BLEClient:
 
         logger.debug("Finished writing")
 
-    async def _read_data(self):
-        data = await self._get_response()
+    FRAME_DELIMITER = b"\x02\xfd"
+    MAX_RESYNC_BYTES = 512
 
-        if data is None:
+    async def _fill(self, data, sequences, deadline):
+        """Append one stamped notification, or None if nothing arrives."""
+        notification = await self._get_notification(deadline)
+        if notification is None:
             return None
+        data.extend(notification.data)
+        sequences.extend([notification.sequence] * len(notification.data))
+        return data, sequences
 
-        if len(data) < 3:
-            # We got such a small amount of data, let's try again
-            if (chunk := await self._get_response()) is None:
+    async def _read_data(self, wait_seconds=10, min_sequence=None):
+        """Read one complete frame, preserving surplus bytes for the next read."""
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        data = bytearray(self._rx)
+        sequences = list(self._rx_sequences)
+        if data and len(sequences) != len(data):
+            sequences = [0] * len(data)
+        self._reset_receive_state()
+
+        if not data:
+            filled = await self._fill(data, sequences, deadline)
+            if filled is None:
                 return None
-            data = data + chunk
+            data, sequences = filled
 
-            if len(data) < 3:
-                # Something is wrong
+        dropped = 0
+        while True:
+            if dropped > self.MAX_RESYNC_BYTES:
+                logger.error("Exceeded resynchronisation limit")
                 return None
 
-        length = data[2] + 4
+            while (offset := data.find(self.FRAME_DELIMITER)) == -1:
+                if dropped + len(data) > self.MAX_RESYNC_BYTES:
+                    logger.error(
+                        "No frame delimiter in %d bytes, dropping: '%s'",
+                        dropped + len(data),
+                        binascii.hexlify(data).decode(),
+                    )
+                    return None
+                filled = await self._fill(data, sequences, deadline)
+                if filled is None:
+                    return None
+                data, sequences = filled
+            if offset:
+                dropped += offset
+                data = data[offset:]
+                sequences = sequences[offset:]
 
-        logger.debug("Waiting for %d bytes", length)
+            while len(data) < 4:
+                filled = await self._fill(data, sequences, deadline)
+                if filled is None:
+                    return None
+                data, sequences = filled
 
-        while len(data) < length:
-            try:
-                data = data + await asyncio.wait_for(self.queue.get(), timeout=5)
-            except TimeoutError:
-                logger.error(
-                    "Unable to get full response from device: '%s', currently have %s",
-                    str(binascii.hexlify(data)),
-                    self.address,
+            if data[3] != 0x00:
+                logger.debug("False frame delimiter at byte %d", dropped)
+                dropped += 2
+                data = data[2:]
+                sequences = sequences[2:]
+                continue
+
+            length = data[2] + 4
+            logger.debug("Waiting for %d bytes", length)
+            while len(data) < length:
+                filled = await self._fill(data, sequences, deadline)
+                if filled is None:
+                    logger.error(
+                        "Unable to get full response from device: '%s'", self.address
+                    )
+                    logger.error(
+                        "Expecting %d bytes, only have %d", length, len(data or b"")
+                    )
+                    return None
+                data, sequences = filled
+
+            frame = data[:length]
+            if not _has_valid_frame_boundary(frame):
+                if frame[length - 1] != 0x03:
+                    logger.warning(
+                        "Frame does not end in 0x03: '%s'",
+                        binascii.hexlify(frame).decode(),
+                    )
+                else:
+                    expected = crc(frame, 1, length - 3)
+                    logger.warning(
+                        "Trailing CRC mismatch, got 0x%02x expected 0x%02x: '%s'",
+                        frame[length - 2],
+                        expected,
+                        binascii.hexlify(frame).decode(),
+                    )
+
+                next_offset = data.find(self.FRAME_DELIMITER, 2)
+                if next_offset >= 0:
+                    dropped += next_offset
+                    data = data[next_offset:]
+                    sequences = sequences[next_offset:]
+                    continue
+
+                dropped += max(0, len(data) - 1)
+                data = (
+                    data[-1:] if data[-1:] == self.FRAME_DELIMITER[:1] else bytearray()
                 )
-                logger.error("Expecting %d bytes, only have %d", length, len(data))
-                return None
+                sequences = sequences[-1:] if data else []
+                continue
 
-        logger.info("Final response: %s", str(binascii.hexlify(data)))
+            frame_first_sequence = sequences[0]
+            if min_sequence is not None and frame_first_sequence < min_sequence:
+                logger.debug(
+                    "Discarding stale frame from notification %d (minimum %d): %s",
+                    frame_first_sequence,
+                    min_sequence,
+                    binascii.hexlify(frame).decode(),
+                )
+                data = data[length:]
+                sequences = sequences[length:]
+                continue
 
-        return data
+            if dropped:
+                logger.debug("Discarded %d byte(s) before the frame", dropped)
 
-    async def _request_response(self, request_data):
+            self._rx = bytearray(data[length:])
+            self._rx_sequences = list(sequences[length:])
+            if self._rx:
+                logger.debug(
+                    "Kept %d surplus byte(s) for the next read: '%s'",
+                    len(self._rx),
+                    binascii.hexlify(self._rx).decode(),
+                )
+
+            logger.info("Final response: %s", str(binascii.hexlify(frame)))
+            return frame
+
+    async def _request_response(self, request_data, is_ours=None, wait_seconds=10):
         async with self.lock:
             try:
-                # If there are previous responses, flush them out
-                while not self.queue.empty():
-                    await self.queue.get()
-
+                request_sequence = self._notification_sequence
+                deadline = asyncio.get_running_loop().time() + wait_seconds
                 await self._write_data(request_data)
 
-                response_data = await self._read_data()
-                if response_data is None:
-                    logger.error(
-                        "Unable to communicate with device: '%s'", self.address
+                skipped = 0
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        logger.error(
+                            "No matching response after %d foreign frames",
+                            skipped,
+                        )
+                        if self.is_connected():
+                            await self.disconnect()
+                        return None
+
+                    response_data = await self._read_data(
+                        wait_seconds=remaining,
+                        min_sequence=request_sequence + 1,
                     )
-                    if self.is_connected():
-                        await self.disconnect()
-                    return None
+                    if response_data is None:
+                        logger.error(
+                            "Unable to communicate with device: '%s'", self.address
+                        )
+                        if self.is_connected():
+                            await self.disconnect()
+                        return None
+                    if is_ours is None or is_ours(response_data):
+                        break
+                    skipped += 1
+                    logger.debug(
+                        "Discarding foreign response %d: %s",
+                        skipped,
+                        binascii.hexlify(response_data).decode(),
+                    )
 
             except asyncio.exceptions.CancelledError:
                 logger.debug("Received CancelledError")
@@ -381,6 +556,13 @@ class BLEClient:
         Returns a ResponseResult
         """
         logger.info("starting scan...")
+
+        # A new GATT session cannot complete fragments from the old session.
+        # Clear its sentinel/queued bytes here, once per reconnect, rather than
+        # flushing a potentially live frame before every request.
+        self._session += 1
+        session = self._session
+        self._reset_receive_state(clear_queue=True)
 
         if device is None:
             logger.error("could not find device with address '%s'", self.address)
@@ -442,7 +624,7 @@ class BLEClient:
             characteristic: BleakGATTCharacteristic, data: bytearray
         ):
             logger.info("Received: %s", str(binascii.hexlify(data)))
-            await self.queue.put(data)
+            await self.queue.put(self._make_notification(data, session=session))
 
         try:
             await self.client.start_notify(self.read_char, notification_handler)
@@ -467,10 +649,17 @@ class BLEClient:
                 self.channel_id, (await self.get_protocol())["EnterOperatorPin"]
             )
             request = command.generate_request(code=self.pin)
-            response = await self._request_response(request)
+            response = await self._request_response(
+                request,
+                is_ours=command.is_response_to_this_command,
+            )
             if response is None:
                 return ResponseResult.UNKNOWN_ERROR
-            result = self.get_response_result(response)
+            try:
+                result = self.get_response_result(response)
+            except InvalidResponseError as err:
+                logger.warning("Invalid EnterOperatorPin response: %s", err)
+                return ResponseResult.UNKNOWN_ERROR
             # If the result is UNKNOWN_ERROR, assume the pin was invalid
             return (
                 ResponseResult.INVALID_PIN
@@ -543,6 +732,10 @@ class BLEClient:
         await self.client.disconnect()
         logger.info("disconnected")
 
+        # Nothing from this GATT session may be joined to a future one.  The
+        # sentinel still wakes any reader that is waiting for a notification.
+        self._session += 1
+        self._reset_receive_state(clear_queue=True)
         await self.queue.put(None)
 
     def generate_request_setup_channel_id(self) -> bytearray:
@@ -579,44 +772,30 @@ class BLEClient:
         return data
 
     def validate_response(self, response_data: bytearray) -> bool:
-        if response_data[0] != 0x02:
-            return False
-
-        if response_data[1] != 0xFD:
-            return False
-
-        if response_data[3] != 0x00:  # high byte of length
-            return False
-
-        if response_data[4:8] != self.channel_id.to_bytes(4, byteorder="little"):
-            return False
-
-        if response_data[8] != 0x01:
-            # This is a valid config, but we don't support it
-            # return m1656b(decodeState, c10786f);
-            return False
-
-        if response_data[9] != crc(response_data, 1, 8):
-            return False
-
-        if response_data[10] != 0x01:  # packet type is not 0x01 = response
-            return False
-
-        if response_data[11] != 0xAF:
-            return False
-
-        if (
-            response_data[16] != 0x00
-        ):  # result: OK(0), UNKNOWN_ERROR(1), INVALID_VALUE(2), OUT_OF_RANGE(3), NOT_AVAILABLE(4), NOT_ALLOWED(5), INVALID_GROUP(6), INVALID_ID(7), DEVICE_BUSY(8), INVALID_PIN(9), MOWER_BLOCKED(10);
+        ok = _is_valid_linked_response(response_data, self.channel_id)
+        if ok and response_data[16] != ResponseResult.OK:
             logger.warning("Non zero response result: %d", response_data[16])
-            return False
-
-        return True
+            ok = False
+        if not ok:
+            logger.debug(
+                "Response validation failed, len=%d channel_id=%s frame='%s'",
+                len(response_data),
+                hex(self.channel_id),
+                binascii.hexlify(response_data).decode(),
+            )
+        return ok
 
     def get_response_result(self, response_data: bytearray) -> ResponseResult:
-        if self.validate_response(response_data) is False:
-            # Just log if the response is invalid as this has been seen with user
-            # logs from official apps. I.e. it is somewhat expected.
-            logger.warning("Response failed validation")
+        if not _is_valid_linked_response(response_data, self.channel_id):
+            raise InvalidResponseError(
+                f"invalid linked response ({len(response_data)} bytes): "
+                f"{binascii.hexlify(response_data).decode()}"
+            )
 
-        return ResponseResult(response_data[16])
+        try:
+            return ResponseResult(response_data[16])
+        except (IndexError, ValueError) as err:
+            raise InvalidResponseError(
+                f"invalid response result in frame: "
+                f"{binascii.hexlify(response_data).decode()}"
+            ) from err
