@@ -104,14 +104,17 @@ class Mower(BLEClient):
         """
         command = Command(self.channel_id, (await self.get_protocol())[command_name])
         request = command.generate_request(**kwargs)
-        response = await self._request_response(request)
+        response = await self._request_response(
+            request, is_ours=command.is_response_to_this_command
+        )
         if response is None:
             return None
 
         if command.validate_command_response(response) is False:
-            # Just log if the response is invalid as this has been seen with user
-            # logs from official apps. I.e. it is somewhat expected.
-            logger.warning("Response failed validation for %s", command_name)
+            # The response is linked to this command but reports a failure, so
+            # its payload cannot be parsed as data.
+            logger.debug("Response failed validation for %s", command_name)
+            return None
 
         response_dict = command.parse_response(response)
         if (
@@ -131,7 +134,9 @@ class Mower(BLEClient):
         """
         command = Command(self.channel_id, (await self.get_protocol())[command_name])
         request = command.generate_request(**kwargs)
-        response = await self._request_response(request)
+        response = await self._request_response(
+            request, is_ours=command.is_response_to_this_command
+        )
         if response is None:
             return ResponseResult.UNKNOWN_ERROR, None
 
@@ -158,7 +163,9 @@ class Mower(BLEClient):
         """Send a command while the caller already holds the BLE command lock."""
         command = Command(self.channel_id, (await self.get_protocol())[command_name])
         request = command.generate_request(**kwargs)
-        response = await self._request_response_locked(request)
+        response = await self._request_response_locked(
+            request, is_ours=command.is_response_to_this_command
+        )
         if response is None:
             return ResponseResult.UNKNOWN_ERROR, None
 
