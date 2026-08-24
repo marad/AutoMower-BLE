@@ -109,6 +109,21 @@ class TestProtocolResponses(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await client._read_data(wait_seconds=1), expected)
         self.assertEqual(client._rx, bytearray())
 
+    async def test_reconnect_discards_disconnect_sentinel(self):
+        command = Command(CHANNEL_ID, self.protocol["GetBatteryLevel"])
+        expected = linked_response(command, payload=b"\x05")
+        client = BLEClient(CHANNEL_ID, "00:00:00:00:00:00")
+
+        # disconnect() leaves a sentinel behind to wake a waiting reader. It is
+        # not tied to a session, so a reconnect has to drop it or the first
+        # read of the new connection reports a disconnect.
+        client.queue.put_nowait(None)
+        client._session += 1
+        client._reset_receive_state(clear_queue=True)
+
+        queue_notification(client, expected)
+        self.assertEqual(await client._read_data(wait_seconds=1), expected)
+
     async def test_surplus_complete_frame_is_retained(self):
         command = Command(CHANNEL_ID, self.protocol["GetBatteryLevel"])
         first = linked_response(command, payload=b"\x05")

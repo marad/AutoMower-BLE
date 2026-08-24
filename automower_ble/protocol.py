@@ -24,6 +24,8 @@ GATT_AUTH_ERROR_TEXT = (
     "Insufficient authorization",
     "Insufficient encryption",
 )
+FRAME_DELIMITER = b"\x02\xfd"
+MAX_RESYNC_BYTES = 512
 
 
 class ModeOfOperation(IntEnum):
@@ -96,6 +98,19 @@ def _is_gatt_auth_error(err: Exception) -> bool:
     return any(text in str(err) for text in GATT_AUTH_ERROR_TEXT)
 
 
+def _result_is_ok(frame: bytearray, description: str) -> bool:
+    """Return whether a linked response reports success.
+
+    result: OK(0), UNKNOWN_ERROR(1), INVALID_VALUE(2), OUT_OF_RANGE(3),
+    NOT_AVAILABLE(4), NOT_ALLOWED(5), INVALID_GROUP(6), INVALID_ID(7),
+    DEVICE_BUSY(8), INVALID_PIN(9), MOWER_BLOCKED(10)
+    """
+    if frame[16] != ResponseResult.OK:
+        logger.warning("%s returned %s", description, _response_result_label(frame[16]))
+        return False
+    return True
+
+
 def _has_valid_frame_boundary(frame: bytearray) -> bool:
     """Return whether ``frame`` has the declared length and trailer."""
     if len(frame) < 4 or frame[2] + 4 != len(frame):
@@ -107,7 +122,7 @@ def _is_valid_linked_response(frame: bytearray, channel_id: int) -> bool:
     """Return whether ``frame`` is a complete linked response."""
     return (
         len(frame) >= 19
-        and frame[:2] == b"\x02\xfd"
+        and frame[:2] == FRAME_DELIMITER
         and _has_valid_frame_boundary(frame)
         and frame[3] == 0x00
         and frame[4:8] == channel_id.to_bytes(4, byteorder="little")
@@ -319,19 +334,7 @@ class Command:
     def validate_command_response(self, response_data: bytearray) -> bool:
         if not self.is_response_to_this_command(response_data):
             return False
-
-        if (
-            response_data[16] != 0x00
-        ):  # result: OK(0), UNKNOWN_ERROR(1), INVALID_VALUE(2), OUT_OF_RANGE(3), NOT_AVAILABLE(4), NOT_ALLOWED(5), INVALID_GROUP(6), INVALID_ID(7), DEVICE_BUSY(8), INVALID_PIN(9), MOWER_BLOCKED(10);
-            logger.warning(
-                "Command %d/%d returned %s",
-                self.major,
-                self.minor,
-                _response_result_label(response_data[16]),
-            )
-            return False
-
-        return True
+        return _result_is_ok(response_data, f"Command {self.major}/{self.minor}")
 
 
 class BLEClient:
@@ -398,12 +401,12 @@ class BLEClient:
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                logger.warning("Unable to get response from device: '%s'", self.address)
+                logger.debug("No notification from device: '%s'", self.address)
                 return None
             try:
                 item = await asyncio.wait_for(self.queue.get(), timeout=remaining)
             except TimeoutError:
-                logger.warning("Unable to get response from device: '%s'", self.address)
+                logger.debug("No notification from device: '%s'", self.address)
                 return None
 
             if item is None:
@@ -429,17 +432,14 @@ class BLEClient:
 
         logger.debug("Finished writing")
 
-    FRAME_DELIMITER = b"\x02\xfd"
-    MAX_RESYNC_BYTES = 512
-
-    async def _fill(self, data, sequences, deadline):
-        """Append one stamped notification, or None if nothing arrives."""
+    async def _fill(self, data, sequences, deadline) -> bool:
+        """Append one stamped notification; False if none arrives in time."""
         notification = await self._get_notification(deadline)
         if notification is None:
-            return None
+            return False
         data.extend(notification.data)
         sequences.extend([notification.sequence] * len(notification.data))
-        return data, sequences
+        return True
 
     async def _read_data(self, wait_seconds=10, min_sequence=None):
         """Read one complete frame, preserving surplus bytes for the next read.
@@ -453,40 +453,33 @@ class BLEClient:
         sequences = list(self._rx_sequences)
         self._reset_receive_state()
 
-        if not data:
-            filled = await self._fill(data, sequences, deadline)
-            if filled is None:
-                return None
-            data, sequences = filled
+        if not data and not await self._fill(data, sequences, deadline):
+            return None
 
         dropped = 0
         while True:
-            if dropped > self.MAX_RESYNC_BYTES:
+            if dropped > MAX_RESYNC_BYTES:
                 logger.warning("Exceeded resynchronisation limit")
                 return None
 
-            while (offset := data.find(self.FRAME_DELIMITER)) == -1:
-                if dropped + len(data) > self.MAX_RESYNC_BYTES:
+            while (offset := data.find(FRAME_DELIMITER)) == -1:
+                if dropped + len(data) > MAX_RESYNC_BYTES:
                     logger.warning(
                         "No frame delimiter in %d bytes, dropping: '%s'",
                         dropped + len(data),
                         binascii.hexlify(data).decode(),
                     )
                     return None
-                filled = await self._fill(data, sequences, deadline)
-                if filled is None:
+                if not await self._fill(data, sequences, deadline):
                     return None
-                data, sequences = filled
             if offset:
                 dropped += offset
                 data = data[offset:]
                 sequences = sequences[offset:]
 
             while len(data) < 4:
-                filled = await self._fill(data, sequences, deadline)
-                if filled is None:
+                if not await self._fill(data, sequences, deadline):
                     return None
-                data, sequences = filled
 
             if data[3] != 0x00:  # high byte of length
                 logger.debug("False frame delimiter at byte %d", dropped)
@@ -498,8 +491,7 @@ class BLEClient:
             length = data[2] + 4
             logger.debug("Waiting for %d bytes", length)
             while len(data) < length:
-                filled = await self._fill(data, sequences, deadline)
-                if filled is None:
+                if not await self._fill(data, sequences, deadline):
                     logger.warning(
                         "Unable to get full response from device '%s', "
                         "expecting %d bytes, only have %d",
@@ -508,11 +500,13 @@ class BLEClient:
                         len(data),
                     )
                     return None
-                data, sequences = filled
 
+            # The declared length is known here, so check the trailer itself
+            # rather than re-deriving it through _has_valid_frame_boundary().
             frame = data[:length]
-            if not _has_valid_frame_boundary(frame):
-                if frame[length - 1] != 0x03:
+            expected_crc = crc(frame, 1, length - 3)
+            if frame[-1] != 0x03 or frame[-2] != expected_crc:
+                if frame[-1] != 0x03:
                     logger.warning(
                         "Frame does not end in 0x03: '%s'",
                         binascii.hexlify(frame).decode(),
@@ -520,14 +514,14 @@ class BLEClient:
                 else:
                     logger.warning(
                         "Trailing CRC mismatch, got 0x%02x expected 0x%02x: '%s'",
-                        frame[length - 2],
-                        crc(frame, 1, length - 3),
+                        frame[-2],
+                        expected_crc,
                         binascii.hexlify(frame).decode(),
                     )
 
                 # The declared length was not trustworthy, so resynchronise on
                 # the next delimiter instead of consuming ``length`` bytes.
-                next_offset = data.find(self.FRAME_DELIMITER, 2)
+                next_offset = data.find(FRAME_DELIMITER, 2)
                 if next_offset >= 0:
                     dropped += next_offset
                     data = data[next_offset:]
@@ -535,9 +529,7 @@ class BLEClient:
                     continue
 
                 dropped += max(0, len(data) - 1)
-                data = (
-                    data[-1:] if data[-1:] == self.FRAME_DELIMITER[:1] else bytearray()
-                )
+                data = data[-1:] if data[-1:] == FRAME_DELIMITER[:1] else bytearray()
                 sequences = sequences[-1:] if data else []
                 continue
 
@@ -944,16 +936,7 @@ class BLEClient:
             )
             return False
 
-        if (
-            response_data[16] != 0x00
-        ):  # result: OK(0), UNKNOWN_ERROR(1), INVALID_VALUE(2), OUT_OF_RANGE(3), NOT_AVAILABLE(4), NOT_ALLOWED(5), INVALID_GROUP(6), INVALID_ID(7), DEVICE_BUSY(8), INVALID_PIN(9), MOWER_BLOCKED(10);
-            logger.warning(
-                "Protocol response returned %s",
-                _response_result_label(response_data[16]),
-            )
-            return False
-
-        return True
+        return _result_is_ok(response_data, "Protocol response")
 
     def get_response_result(self, response_data: bytearray) -> ResponseResult:
         """Return the result code of a linked response.
